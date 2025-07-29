@@ -11,6 +11,10 @@
 #include <vector>
 #include <locale>
 #include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <curand_kernel.h>
+#include <numeric> 
+#include <cublas_v2.h>
 
 __global__ void matmul_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -62,6 +66,407 @@ void matmul_cuda(const std::vector<std::vector<float>> &A,
 
 
 
+__global__ void add_bias_kernel(float* y, const float* b, int M, int N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;  // muestra
+    int col = blockIdx.x * blockDim.x + threadIdx.x;  // dimensión
+    if (row < M && col < N) {
+        y[row * N + col] += b[col];
+    }
+}
+
+__global__ void transpose_kernel(const float* input, float* output, int rows, int cols) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y; // fila original
+    int j = blockIdx.x * blockDim.x + threadIdx.x; // columna original
+
+    if (i < rows && j < cols)
+        output[j * rows + i] = input[i * cols + j];
+}
+
+__global__ void softmax_kernel(float* mat, int rows, int cols) {
+    extern __shared__ float shdata[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if (row >= rows || tid >= cols) return;
+
+    float* row_data = mat + row * cols;
+
+    // Paso 1: hallar el máximo de la fila
+    float maxval = -1e20f;
+    for (int i = tid; i < cols; i += blockDim.x)
+        maxval = fmaxf(maxval, row_data[i]);
+    shdata[tid] = maxval;
+    __syncthreads();
+
+    // Reducimos para hallar el verdadero máximo
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset)
+            shdata[tid] = fmaxf(shdata[tid], shdata[tid + offset]);
+        __syncthreads();
+    }
+    maxval = shdata[0];
+    __syncthreads();
+
+    // Paso 2: calcular suma de exponenciales
+    float sum = 0.f;
+    for (int i = tid; i < cols; i += blockDim.x)
+        sum += expf(row_data[i] - maxval);
+    shdata[tid] = sum;
+    __syncthreads();
+
+    // Reducción para suma total
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset)
+            shdata[tid] += shdata[tid + offset];
+        __syncthreads();
+    }
+    sum = shdata[0];
+    __syncthreads();
+
+    // Paso 3: normalizar
+    for (int i = tid; i < cols; i += blockDim.x)
+        row_data[i] = expf(row_data[i] - maxval) / sum;
+}
+
+
+__global__ void layernorm_kernel(
+    float* x, float* y, const float* gamma, const float* beta,
+    int T, int D, float eps)
+{
+    int t = blockIdx.x;      // fila
+    int j = threadIdx.x;     // dimensión
+
+    extern __shared__ float stats[];
+    float* mu = stats;
+    float* var = stats + T;
+
+    if (j >= D || t >= T) return;
+
+    float* row = x + t * D;
+
+    // Paso 1: calcular media (por hilo con reducción implícita)
+    float sum = 0.f;
+    for (int k = 0; k < D; ++k)
+        sum += row[k];
+    float mean = sum / D;
+
+    // Paso 2: calcular varianza
+    float sqsum = 0.f;
+    for (int k = 0; k < D; ++k)
+        sqsum += (row[k] - mean) * (row[k] - mean);
+    float variance = sqsum / D;
+
+    float std_inv = rsqrtf(variance + eps);
+    float xhat = (row[j] - mean) * std_inv;
+    y[t * D + j] = gamma[j] * xhat + beta[j];
+}
+
+__global__ void relu_kernel(float* mat, float* mask, int M, int N) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < M && j < N) {
+        int idx = i * N + j;
+        float val = mat[idx];
+        if (val > 0) {
+            mask[idx] = 1.f;
+        } else {
+            mat[idx] = 0.f;
+            mask[idx] = 0.f;
+        }
+    }
+}
+
+
+__global__ void dropout_kernel(float* mat, float* mask, int M, int N, float rate, unsigned long seed) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < M && j < N) {
+        int idx = i * N + j;
+
+        curandState state;
+        curand_init(seed, idx, 0, &state);
+        float rand_val = curand_uniform(&state);
+
+        float keep = (rand_val > rate) ? 1.f : 0.f;
+        mask[idx] = keep;
+        mat[idx] *= keep / (1.f - rate);
+    }
+}
+
+__global__ void avg_pool_kernel(const float* input, float* output, int T, int D) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= D) return;
+
+    float sum = 0.f;
+    for (int t = 0; t < T; ++t) {
+        sum += input[t * D + j];
+    }
+    output[j] = sum / T;
+}
+
+///////////////////                  CUDA                ////////////////////////////
+
+void matmul_cuda_head(const std::vector<std::vector<float>> &A,
+                      const std::vector<std::vector<float>> &B,
+                      std::vector<std::vector<float>> &C)
+{
+    int M = A.size();     // T
+    int N = A[0].size();  // d_k
+    int K = B[0].size();  // d_k o T
+
+    std::vector<float> A_flat(M * N), B_flat(N * K), C_flat(M * K);
+
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j)
+            A_flat[i * N + j] = A[i][j];
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < K; ++j)
+            B_flat[i * K + j] = B[i][j];
+
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, M * N * sizeof(float));
+    cudaMalloc(&d_B, N * K * sizeof(float));
+    cudaMalloc(&d_C, M * K * sizeof(float));
+    cudaMemcpy(d_A, A_flat.data(), M * N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B_flat.data(), N * K * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 block(16, 16), grid((K + 15) / 16, (M + 15) / 16);
+    matmul_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+
+    cudaMemcpy(C_flat.data(), d_C, M * K * sizeof(float), cudaMemcpyDeviceToHost);
+    C.resize(M, std::vector<float>(K));
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < K; ++j)
+            C[i][j] = C_flat[i * K + j];
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+}
+
+void average_pool_cuda(const std::vector<std::vector<float>> &input,
+                       std::vector<float> &output)
+{
+    int T = input.size();     // número de pasos
+    int D = input[0].size();  // dimensión del modelo
+
+    std::vector<float> input_flat(T * D);
+    output.resize(D);
+
+    for (int t = 0; t < T; ++t)
+        for (int j = 0; j < D; ++j)
+            input_flat[t * D + j] = input[t][j];
+
+    float *d_input, *d_output;
+    cudaMalloc(&d_input, T * D * sizeof(float));
+    cudaMalloc(&d_output, D * sizeof(float));
+    cudaMemcpy(d_input, input_flat.data(), T * D * sizeof(float), cudaMemcpyHostToDevice);
+
+    int block = 256;
+    int grid = (D + block - 1) / block;
+    avg_pool_kernel<<<grid, block>>>(d_input, d_output, T, D);
+
+    cudaMemcpy(output.data(), d_output, D * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_input); cudaFree(d_output);
+}
+
+
+void dropout_cuda(std::vector<std::vector<float>> &mat,
+                  std::vector<std::vector<float>> &mask,
+                  float rate, bool train=true)
+{
+    if (!train || rate <= 0.f) {
+        mask = std::vector<std::vector<float>>(mat.size(), std::vector<float>(mat[0].size(), 1.f));
+        return;
+    }
+
+    int M = mat.size(), N = mat[0].size();
+    std::vector<float> mat_flat(M * N), mask_flat(M * N);
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j)
+            mat_flat[i * N + j] = mat[i][j];
+
+    float *d_mat, *d_mask;
+    cudaMalloc(&d_mat, M * N * sizeof(float));
+    cudaMalloc(&d_mask, M * N * sizeof(float));
+    cudaMemcpy(d_mat, mat_flat.data(), M * N * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 block(16, 16), grid((N + 15) / 16, (M + 15) / 16);
+    dropout_kernel<<<grid, block>>>(d_mat, d_mask, M, N, rate, time(NULL));
+
+    cudaMemcpy(mat_flat.data(), d_mat, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(mask_flat.data(), d_mask, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+    mat.resize(M, std::vector<float>(N));
+    mask.resize(M, std::vector<float>(N));
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j) {
+            mat[i][j] = mat_flat[i * N + j];
+            mask[i][j] = mask_flat[i * N + j];
+        }
+
+    cudaFree(d_mat); cudaFree(d_mask);
+}
+
+void relu_cuda(std::vector<std::vector<float>> &mat,
+               std::vector<std::vector<float>> &mask)
+{
+    int M = mat.size(), N = mat[0].size();
+    std::vector<float> mat_flat(M * N), mask_flat(M * N);
+
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j)
+            mat_flat[i * N + j] = mat[i][j];
+
+    float *d_mat, *d_mask;
+    cudaMalloc(&d_mat, M * N * sizeof(float));
+    cudaMalloc(&d_mask, M * N * sizeof(float));
+
+    cudaMemcpy(d_mat, mat_flat.data(), M * N * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 block(16, 16);
+    dim3 grid((N + 15) / 16, (M + 15) / 16);
+    relu_kernel<<<grid, block>>>(d_mat, d_mask, M, N);
+
+    cudaMemcpy(mat_flat.data(), d_mat, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(mask_flat.data(), d_mask, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+
+    mat.resize(M, std::vector<float>(N));
+    mask.resize(M, std::vector<float>(N));
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j) {
+            mat[i][j] = mat_flat[i * N + j];
+            mask[i][j] = mask_flat[i * N + j];
+        }
+
+    cudaFree(d_mat); cudaFree(d_mask);
+}
+
+
+
+void layernorm_cuda(std::vector<std::vector<float>>& x,
+                    const std::vector<float>& gamma,
+                    const std::vector<float>& beta,
+                    std::vector<std::vector<float>>& y,
+                    float eps = 1e-6f)
+{
+    int T = x.size();     // número de filas
+    int D = x[0].size();  // dimensión
+
+    std::vector<float> x_flat(T * D), y_flat(T * D);
+    for (int i = 0; i < T; ++i)
+        for (int j = 0; j < D; ++j)
+            x_flat[i * D + j] = x[i][j];
+
+    float *d_x, *d_y, *d_gamma, *d_beta;
+    cudaMalloc(&d_x, T * D * sizeof(float));
+    cudaMalloc(&d_y, T * D * sizeof(float));
+    cudaMalloc(&d_gamma, D * sizeof(float));
+    cudaMalloc(&d_beta, D * sizeof(float));
+
+    cudaMemcpy(d_x, x_flat.data(), T * D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_gamma, gamma.data(), D * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_beta, beta.data(), D * sizeof(float), cudaMemcpyHostToDevice);
+
+    layernorm_kernel<<<T, D>>>(d_x, d_y, d_gamma, d_beta, T, D, eps);
+    cudaMemcpy(y_flat.data(), d_y, T * D * sizeof(float), cudaMemcpyDeviceToHost);
+
+    y.resize(T, std::vector<float>(D));
+    for (int i = 0; i < T; ++i)
+        for (int j = 0; j < D; ++j)
+            y[i][j] = y_flat[i * D + j];
+
+    cudaFree(d_x); cudaFree(d_y); cudaFree(d_gamma); cudaFree(d_beta);
+}
+
+
+void softmax_cuda(std::vector<std::vector<float>> &mat) {
+    int rows = mat.size();
+    int cols = mat[0].size();
+    std::vector<float> flat(rows * cols);
+
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            flat[i * cols + j] = mat[i][j];
+
+    float* d_mat;
+    cudaMalloc(&d_mat, rows * cols * sizeof(float));
+    cudaMemcpy(d_mat, flat.data(), rows * cols * sizeof(float), cudaMemcpyHostToDevice);
+
+    int threads = 256;
+    size_t shmem = threads * sizeof(float);
+    softmax_kernel<<<rows, threads, shmem>>>(d_mat, rows, cols);
+
+    cudaMemcpy(flat.data(), d_mat, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_mat);
+
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            mat[i][j] = flat[i * cols + j];
+}
+
+void transpose_cuda(const std::vector<std::vector<float>> &A,
+                    std::vector<std::vector<float>> &B)
+{
+    int rows = A.size();
+    int cols = A[0].size();
+    std::vector<float> A_flat(rows * cols), B_flat(cols * rows);
+
+    // Aplanar matriz A
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            A_flat[i * cols + j] = A[i][j];
+
+    float *d_in, *d_out;
+    cudaMalloc(&d_in, rows * cols * sizeof(float));
+    cudaMalloc(&d_out, cols * rows * sizeof(float));
+    cudaMemcpy(d_in, A_flat.data(), rows * cols * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 block(16, 16);
+    dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
+    transpose_kernel<<<grid, block>>>(d_in, d_out, rows, cols);
+
+    cudaMemcpy(B_flat.data(), d_out, cols * rows * sizeof(float), cudaMemcpyDeviceToHost);
+    B.resize(cols, std::vector<float>(rows));
+    for (int i = 0; i < cols; ++i)
+        for (int j = 0; j < rows; ++j)
+            B[i][j] = B_flat[i * rows + j];
+
+    cudaFree(d_in);
+    cudaFree(d_out);
+}
+
+
+
+void add_bias_cuda(std::vector<std::vector<float>>& Y, const std::vector<float>& B) {
+    int M = Y.size();
+    int N = Y[0].size();
+
+    std::vector<float> Y_flat(M * N);
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j)
+            Y_flat[i * N + j] = Y[i][j];
+
+    float* d_Y;
+    float* d_B;
+    cudaMalloc(&d_Y, M * N * sizeof(float));
+    cudaMalloc(&d_B, N * sizeof(float));
+    cudaMemcpy(d_Y, Y_flat.data(), M * N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B.data(), N * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 block(16, 16);
+    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    add_bias_kernel<<<grid, block>>>(d_Y, d_B, M, N);
+
+    cudaMemcpy(Y_flat.data(), d_Y, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j)
+            Y[i][j] = Y_flat[i * N + j];
+
+    cudaFree(d_Y);
+    cudaFree(d_B);
+}
+
+
+
 // Aleatoriedad reproducible
 std::mt19937 rng(42);
 auto randf = [](float a, float b) {
@@ -89,34 +494,21 @@ struct MuestraMnist {
 // Layer Normalization
 struct CapaNorm {
     float eps;
-    std::vector<float> gamma, beta;
-    std::vector<float> grad_gamma, grad_beta;
+    std::vector<float> gamma, beta, grad_gamma, grad_beta;
     std::vector<std::vector<float>> cache_xhat;
-    // buffers Adam
     std::vector<float> m_g, v_g, m_b, v_b;
+    int tstep = 0;
     CapaNorm(int dim, float eps_ = 1e-6f) : eps(eps_) {
-        gamma.assign(dim, 1.f);
-        beta.assign(dim, 0.f);
-        grad_gamma.assign(dim, 0.f);
-        grad_beta.assign(dim, 0.f);
+        gamma.assign(dim, 1.f); beta.assign(dim, 0.f);
+        grad_gamma.assign(dim, 0.f); grad_beta.assign(dim, 0.f);
     }
     std::vector<std::vector<float>> forward(const std::vector<std::vector<float>> &x) {
         int T = x.size(), D = x[0].size();
         cache_xhat.assign(T, std::vector<float>(D));
-        std::vector<std::vector<float>> y(T, std::vector<float>(D));
-        for (int t = 0; t < T; ++t) {
-            float media = 0, var = 0;
-            for (float v : x[t]) media += v;
-            media /= D;
-            for (float v : x[t]) var += (v - media)*(v - media);
-            var /= D;
-            float stdv = std::sqrt(var + eps);
-            for (int j = 0; j < D; ++j) {
-                float xhat = (x[t][j] - media)/stdv;
-                cache_xhat[t][j] = xhat;
-                y[t][j] = gamma[j]*xhat + beta[j];
-            }
-        }
+
+        std::vector<std::vector<float>> y;
+        layernorm_cuda(const_cast<std::vector<std::vector<float>>&>(x), gamma, beta, y, eps);
+        cache_xhat = y; 
         return y;
     }
     std::vector<std::vector<float>> backward(const std::vector<std::vector<float>> &grad_out) {
@@ -138,13 +530,11 @@ struct CapaNorm {
     }
     void step_adam(float lr, int batch, float beta1, float beta2, float eps_opt) {
         if (m_g.empty()) {
-            m_g.assign(gamma.size(),0.f);
-            v_g.assign(gamma.size(),0.f);
-            m_b.assign(beta.size(),0.f);
-            v_b.assign(beta.size(),0.f);
+            m_g.assign(gamma.size(),0.f); v_g.assign(gamma.size(),0.f);
+            m_b.assign(beta.size(),0.f); v_b.assign(beta.size(),0.f);
         }
-        static int t = 0; ++t;
-        float lr_t = lr*std::sqrt(1 - std::pow(beta2,t))/(1 - std::pow(beta1,t));
+        tstep++;
+        float lr_t = lr*std::sqrt(1 - std::pow(beta2, tstep))/(1 - std::pow(beta1, tstep));
         for (size_t i = 0; i < gamma.size(); ++i) {
             float g = grad_gamma[i]/batch;
             m_g[i] = beta1*m_g[i] + (1-beta1)*g;
@@ -196,7 +586,6 @@ struct Lineal {
     std::vector<std::vector<float>> cache_x;
     float beta1=0.9f, beta2=0.999f, eps_opt=1e-8f;
     int tstep=0;
-
     Lineal(int dim_in,int dim_out) {
         float lim = std::sqrt(6.f/(dim_in+dim_out));
         w.resize(dim_out, std::vector<float>(dim_in));
@@ -208,8 +597,14 @@ struct Lineal {
         m_b.assign(dim_out,0.f); v_b.assign(dim_out,0.f);
         for(float &val: b) val = randf(-lim, lim);
     }
-
-    // Forward para un vector
+    std::vector<std::vector<float>> transpuesta(const std::vector<std::vector<float>> &mat) {
+        int filas = mat.size(), cols = mat[0].size();
+        std::vector<std::vector<float>> res(cols, std::vector<float>(filas));
+        for (int i = 0; i < filas; ++i)
+            for (int j = 0; j < cols; ++j)
+                res[j][i] = mat[i][j];
+        return res;
+    }
     std::vector<float> forward(const std::vector<float> &x) {
         cache_x = {x};
         std::vector<float> y(w.size());
@@ -221,8 +616,7 @@ struct Lineal {
         }
         return y;
     }
-
-    // Forward por lotes preservando cache_x completo
+    //Forward por lotes usando CUDA
     std::vector<std::vector<float>> forward(const std::vector<std::vector<float>> &x) {
         cache_x = x;
         int num_muestras = x.size();
@@ -230,14 +624,11 @@ struct Lineal {
         int dim_entrada  = w[0].size();
         std::vector<std::vector<float>> y(num_muestras, std::vector<float>(dim_salida));
         std::vector<std::vector<float>> w_T;
-
-        matmul_cuda(x, transpuesta(w), y); // multiplicación x × w^T
-      //  for (int n = 0; n < num_muestras; ++n)
-        //    for (int i = 0; i < dim_salida; ++i)
-          //      y[n][i] += b[i];
+        transpose_cuda(w, w_T);
+        matmul_cuda(x, w_T, y);
+        add_bias_cuda(y, b);
         return y;
     }
-
     std::vector<std::vector<float>> backward(const std::vector<std::vector<float>> &g_out) {
         int N=g_out.size(), D_in=w[0].size();
         std::vector<std::vector<float>> grad_in(N, std::vector<float>(D_in,0.f));
@@ -258,9 +649,8 @@ struct Lineal {
         auto gm = backward(std::vector<std::vector<float>>{g_out});
         return gm[0];
     }
-
     void step_adam(float lr,int batch) {
-        ++tstep;
+        tstep++;
         float lr_t = lr*std::sqrt(1 - std::pow(beta2,tstep))/(1 - std::pow(beta1,tstep));
         for(size_t i=0;i<w.size();++i) {
             for(size_t j=0;j<w[i].size();++j) {
@@ -495,12 +885,11 @@ struct ClasificadorMNIST {
             for(int j=0;j<d_model;++j)
                 x[t][j] += pos_enc[t][j];
         auto enc_out = encoder.forward(x,train);
-        std::vector<float> pooled(d_model,0.f);
-        for(int j=0;j<d_model;++j)
-            for(int t=0;t<seq_len;++t)
-                pooled[j] += enc_out[t][j]/seq_len;
+
+        std::vector<float> pooled;
+        average_pool_cuda(enc_out, pooled);
         auto logits = capa_salida.forward(pooled);
-        return {enc_out, logits};
+        return std::make_tuple(enc_out, logits);
     }
     void backward_batch(const std::vector<float> &d_logits) {
         auto d_pooled = capa_salida.backward(d_logits);
@@ -568,67 +957,148 @@ std::vector<MuestraMnist> cargar_mnist_csv(const std::string &ruta) {
 
 
 int main() {
-    auto train = cargar_mnist_csv("mnist_train.csv");
-    auto test  = cargar_mnist_csv("mnist_test.csv");
+    auto dataset = cargar_mnist_csv("mnist_train.csv");
+    auto test = cargar_mnist_csv("mnist_test.csv");
 
-    std::cout << "Empezando\n";
+    verificar_gpu();
+
+
+    int n_train = int(dataset.size() * 0.9);
+    std::vector<MuestraMnist> train(dataset.begin(), dataset.begin() + n_train);
+    std::vector<MuestraMnist> val(dataset.begin() + n_train, dataset.end());
+
+    std::cout << "Train: " << train.size()
+              << ", Val: " << val.size()
+              << ", Test: " << test.size() << " muestras\n";
 
     ClasificadorMNIST modelo;
     float lr = 3e-4f;
     int epochs = 10;
-    int batch_size = 64;
+    int batch_size = 128;
+
+    float best_val_acc = 0.0f;
+    float best_test_acc = 0.0f;
+    int patience = 3;
+    int wait = 0;
+    int lr_wait = 0;
 
     for (int e = 0; e < epochs; ++e) {
         std::shuffle(train.begin(), train.end(), rng);
         float loss_acum = 0.f;
         int cont = 0;
-        std::vector<std::pair<std::vector<std::vector<float>>, int>> buffer;
-        buffer.reserve(batch_size);
+        std::vector<std::vector<std::vector<float>>> imgs_batch;
+        std::vector<int> labels_batch;
 
-        // ——— Entrenamiento ———
         for (size_t idx = 0; idx < train.size(); ++idx) {
             auto &m = train[idx];
-            auto [feat, logits] = modelo.forward_cache(m.imagen, true);
-            auto probs = logits;
-            softmax(probs);
-            loss_acum += perdida_cross_entropy(probs, m.etiqueta);
+            imgs_batch.push_back(m.imagen);
+            labels_batch.push_back(m.etiqueta);
 
-            buffer.emplace_back(m.imagen, m.etiqueta);
-            if (buffer.size() == batch_size || idx + 1 == train.size()) {
-                for (auto &[img, label] : buffer) {
-                    auto [_, logits_b] = modelo.forward_cache(img, true);
-                    auto probs_b = logits_b;
-                    softmax(probs_b);
+            if (imgs_batch.size() == batch_size || idx + 1 == train.size()) {
+                for (size_t b = 0; b < imgs_batch.size(); ++b) {
+                    auto tuple_out = modelo.forward_cache(imgs_batch[b], true);
+                    auto &logits = std::get<1>(tuple_out);
+                    std::vector<std::vector<float>> logits_mat = {logits};
+                    softmax_cuda(logits_mat);
+                    auto &probs = logits_mat[0];
+                    
+                    loss_acum += perdida_cross_entropy(probs, labels_batch[b]);
                     std::vector<float> dlog(10);
                     for (int k = 0; k < 10; ++k)
-                        dlog[k] = probs_b[k] - (k == label ? 1.f : 0.f);
+                        dlog[k] = probs[k] - (k == labels_batch[b] ? 1.f : 0.f);
                     modelo.backward_batch(dlog);
                 }
-                modelo.step_adam_batch(lr, buffer.size());
-                buffer.clear();
+                modelo.step_adam_batch(lr, imgs_batch.size());
+                imgs_batch.clear();
+                labels_batch.clear();
             }
-
             if (++cont % 2000 == 0)
-                std::cout << "  " << cont << " muestras...\n";
+                std::cout << "  " << cont << " muestras procesadas...\n";
         }
 
-        // ——— Pérdida media de la época ———
-        float perdida_media = loss_acum / train.size();
-        std::cout << "Epoch " << (e+1)
-                  << " - pérdida media: " << perdida_media;
+        std::cout << "Epoch " << e+1 << " - pérdida media: "
+                  << (loss_acum / train.size()) << "\n";
 
-        // ——— Cálculo de exactitud en test ———
-        int aciertos = 0;
-        for (auto &m : test) {
-            auto [feat_t, logits_t] = modelo.forward_cache(m.imagen, false);
-            auto probs_t = logits_t;
-            softmax(probs_t);
-            if (argmax(probs_t) == m.etiqueta)
-                ++aciertos;
+        int aciertos_train = 0;
+        for (auto &m : train) {
+            auto tuple_out = modelo.forward_cache(m.imagen, false);
+            auto &logits = std::get<1>(tuple_out);
+            std::vector<std::vector<float>> logits_mat = {logits};
+            softmax_cuda(logits_mat);
+            auto &probs = logits_mat[0];
+            if (argmax(probs) == m.etiqueta)
+                ++aciertos_train;
         }
-        float exactitud = 100.f * aciertos / test.size();
-        std::cout << " - exactitud test: " << exactitud << "%\n";
+        float acc_train = 100.f * aciertos_train / train.size();
+        std::cout << "Exactitud en entrenamiento: " << acc_train << "%\n";
+
+        int aciertos_val = 0;
+        for (auto &m : val) {
+            auto tuple_out = modelo.forward_cache(m.imagen, false);
+            auto &logits = std::get<1>(tuple_out);
+            std::vector<std::vector<float>> logits_mat = {logits};
+            softmax_cuda(logits_mat);
+            auto &probs = logits_mat[0];
+
+            if (argmax(probs) == m.etiqueta)
+                ++aciertos_val;
+        }
+        float acc_val = 100.f * aciertos_val / val.size();
+        std::cout << "Exactitud en validación: " << acc_val << "%\n";
+        std::cout << "------------------------------------------\n";
+
+        // Early stopping & LR scheduling
+        if (acc_val > best_val_acc) {
+            best_val_acc = acc_val;
+            wait = 0;
+            lr_wait = 0;
+    std::vector<int> y_true, y_pred;
+    float loss_test = 0.f;
+
+    for (auto &m : test) {
+        auto tuple_out = modelo.forward_cache(m.imagen, false);
+        auto &logits = std::get<1>(tuple_out);
+        std::vector<std::vector<float>> logits_mat = {logits};
+        softmax_cuda(logits_mat);
+        auto &probs = logits_mat[0];
+
+        y_true.push_back(m.etiqueta);
+        y_pred.push_back(argmax(probs));
+        loss_test += perdida_cross_entropy(probs, m.etiqueta);
     }
 
+    float acc_test = precision_micro(y_true, y_pred);  // = accuracy
+    float prec = precision_micro(y_true, y_pred);
+    float rec = recall_micro(y_true, y_pred);
+    float f1 = f1_micro(prec, rec);
+    float avg_loss = loss_test / test.size();
+
+    if (acc_test > best_test_acc)
+        best_test_acc = acc_test;
+
+    std::cout << "  (Mejoró)\n";
+    std::cout << "  >> Exactitud en test: " << acc_test << "%\n";
+    std::cout << "  >> Precision (micro): " << prec << "%\n";
+    std::cout << "  >> Recall    (micro): " << rec << "%\n";
+    std::cout << "  >> F1 Score  (micro): " << f1 << "%\n";
+    std::cout << "  >> Pérdida promedio: " << avg_loss << "\n";
+
+
+        } else {
+            ++wait;
+            ++lr_wait;
+            if (lr_wait >= 2) {
+                lr *= 0.5f;
+                std::cout << "Reduciendo learning rate a: " << lr << "\n";
+                lr_wait = 0;
+            }
+            if (wait >= patience) {
+                std::cout << "Early stopping activado (sin mejora en val por " << patience << " épocas)\n";
+                break;
+            }
+        }
+    }
+    std::cout << "Mejor exactitud en test alcanzada: " << best_test_acc << "%\n";
     return 0;
 }
+    
