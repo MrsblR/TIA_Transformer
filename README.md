@@ -18,7 +18,7 @@ Este proyecto implementa desde cero (sin frameworks de machine learning) un **cl
 Compila el código con:
 
 ```bash
-nvcc -O2 -std=c++17 -o main main.cu
+nvcc mnist_transformer_full.cu -o diag -lcurand
 
 ./main
 ```
