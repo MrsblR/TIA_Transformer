@@ -9,7 +9,58 @@
 #include <string>
 #include <tuple>
 #include <vector>
-#include <locale>  
+#include <locale>
+#include <cuda_runtime.h>
+
+__global__ void matmul_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M && col < K) {
+        float sum = 0.f;
+        for (int i = 0; i < N; ++i)
+            sum += A[row * N + i] * B[i * K + col];
+        C[row * K + col] = sum;
+    }
+}
+
+void matmul_cuda(const std::vector<std::vector<float>> &A,
+                 const std::vector<std::vector<float>> &B,
+                 std::vector<std::vector<float>> &C)
+{
+    int M = A.size();
+    int N = A[0].size();
+    int K = B[0].size();
+    std::vector<float> A_flat(M * N), B_flat(N * K), C_flat(M * K);
+
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < N; ++j)
+            A_flat[i * N + j] = A[i][j];
+
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < K; ++j)
+            B_flat[i * K + j] = B[i][j];
+
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, M * N * sizeof(float));
+    cudaMalloc(&d_B, N * K * sizeof(float));
+    cudaMalloc(&d_C, M * K * sizeof(float));
+    cudaMemcpy(d_A, A_flat.data(), M * N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, B_flat.data(), N * K * sizeof(float), cudaMemcpyHostToDevice);
+
+    dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+    matmul_kernel<<<grid, block>>>(d_A, d_B, d_C, M, N, K);
+    cudaMemcpy(C_flat.data(), d_C, M * K * sizeof(float), cudaMemcpyDeviceToHost);
+
+    C.resize(M, std::vector<float>(K));
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < K; ++j)
+            C[i][j] = C_flat[i * K + j];
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+}
+
+
 
 // Aleatoriedad reproducible
 std::mt19937 rng(42);
@@ -178,14 +229,12 @@ struct Lineal {
         int dim_salida   = w.size();
         int dim_entrada  = w[0].size();
         std::vector<std::vector<float>> y(num_muestras, std::vector<float>(dim_salida));
-        for (int n = 0; n < num_muestras; ++n) {
-            for (int i = 0; i < dim_salida; ++i) {
-                float s = b[i];
-                for (int j = 0; j < dim_entrada; ++j)
-                    s += w[i][j] * x[n][j];
-                y[n][i] = s;
-            }
-        }
+        std::vector<std::vector<float>> w_T;
+
+        matmul_cuda(x, transpuesta(w), y); // multiplicación x × w^T
+      //  for (int n = 0; n < num_muestras; ++n)
+        //    for (int i = 0; i < dim_salida; ++i)
+          //      y[n][i] += b[i];
         return y;
     }
 
