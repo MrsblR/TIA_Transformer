@@ -1,0 +1,585 @@
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <vector>
+#include <locale>  
+
+// Aleatoriedad reproducible
+std::mt19937 rng(42);
+auto randf = [](float a, float b) {
+    return std::uniform_real_distribution<float>(a, b)(rng);
+};
+
+// Softmax
+void softmax(std::vector<float> &logits) {
+    float maxv = *std::max_element(logits.begin(), logits.end());
+    float denom = 0.f;
+    for (float &v : logits) {
+        v = std::exp(v - maxv);
+        denom += v;
+    }
+    for (float &v : logits)
+        v /= denom;
+}
+
+// Carga MNIST desde CSV
+struct MuestraMnist {
+    std::vector<std::vector<float>> imagen; // 28×28
+    int etiqueta;
+};
+
+// Layer Normalization
+struct CapaNorm {
+    float eps;
+    std::vector<float> gamma, beta;
+    std::vector<float> grad_gamma, grad_beta;
+    std::vector<std::vector<float>> cache_xhat;
+    // buffers Adam
+    std::vector<float> m_g, v_g, m_b, v_b;
+    CapaNorm(int dim, float eps_ = 1e-6f) : eps(eps_) {
+        gamma.assign(dim, 1.f);
+        beta.assign(dim, 0.f);
+        grad_gamma.assign(dim, 0.f);
+        grad_beta.assign(dim, 0.f);
+    }
+    std::vector<std::vector<float>> forward(const std::vector<std::vector<float>> &x) {
+        int T = x.size(), D = x[0].size();
+        cache_xhat.assign(T, std::vector<float>(D));
+        std::vector<std::vector<float>> y(T, std::vector<float>(D));
+        for (int t = 0; t < T; ++t) {
+            float media = 0, var = 0;
+            for (float v : x[t]) media += v;
+            media /= D;
+            for (float v : x[t]) var += (v - media)*(v - media);
+            var /= D;
+            float stdv = std::sqrt(var + eps);
+            for (int j = 0; j < D; ++j) {
+                float xhat = (x[t][j] - media)/stdv;
+                cache_xhat[t][j] = xhat;
+                y[t][j] = gamma[j]*xhat + beta[j];
+            }
+        }
+        return y;
+    }
+    std::vector<std::vector<float>> backward(const std::vector<std::vector<float>> &grad_out) {
+        int T = grad_out.size(), D = grad_out[0].size();
+        std::vector<std::vector<float>> grad_in(T, std::vector<float>(D));
+        for (int j = 0; j < D; ++j) {
+            float sum_gg = 0, sum_gb = 0;
+            for (int t = 0; t < T; ++t) {
+                sum_gg += grad_out[t][j]*cache_xhat[t][j];
+                sum_gb += grad_out[t][j];
+            }
+            grad_gamma[j] += sum_gg;
+            grad_beta[j]  += sum_gb;
+        }
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < D; ++j)
+                grad_in[t][j] = grad_out[t][j]*gamma[j];
+        return grad_in;
+    }
+    void step_adam(float lr, int batch, float beta1, float beta2, float eps_opt) {
+        if (m_g.empty()) {
+            m_g.assign(gamma.size(),0.f);
+            v_g.assign(gamma.size(),0.f);
+            m_b.assign(beta.size(),0.f);
+            v_b.assign(beta.size(),0.f);
+        }
+        static int t = 0; ++t;
+        float lr_t = lr*std::sqrt(1 - std::pow(beta2,t))/(1 - std::pow(beta1,t));
+        for (size_t i = 0; i < gamma.size(); ++i) {
+            float g = grad_gamma[i]/batch;
+            m_g[i] = beta1*m_g[i] + (1-beta1)*g;
+            v_g[i] = beta2*v_g[i] + (1-beta2)*g*g;
+            gamma[i] -= lr_t*m_g[i]/(std::sqrt(v_g[i]) + eps_opt);
+            grad_gamma[i] = 0.f;
+            float gb = grad_beta[i]/batch;
+            m_b[i] = beta1*m_b[i] + (1-beta1)*gb;
+            v_b[i] = beta2*v_b[i] + (1-beta2)*gb*gb;
+            beta[i]  -= lr_t*m_b[i]/(std::sqrt(v_b[i]) + eps_opt);
+            grad_beta[i]  = 0.f;
+        }
+    }
+};
+
+// Dropout
+struct Dropout {
+    float rate;
+    std::vector<std::vector<float>> mask;
+    Dropout(float r=0.1f): rate(r) {}
+    std::vector<std::vector<float>> forward(const std::vector<std::vector<float>> &x, bool train) {
+        if (!train || rate<=0) return x;
+        int T=x.size(), D=x[0].size();
+        mask.assign(T, std::vector<float>(D));
+        auto y = x;
+        for(int t=0;t<T;++t)
+            for(int j=0;j<D;++j) {
+                float keep = randf(0.f,1.f)>rate?1.f:0.f;
+                mask[t][j] = keep;
+                y[t][j] *= keep/(1.f-rate);
+            }
+        return y;
+    }
+    std::vector<std::vector<float>> backward(const std::vector<std::vector<float>> &g_out) {
+        if(mask.empty()) return g_out;
+        int T=g_out.size(), D=g_out[0].size();
+        auto g = g_out;
+        for(int t=0;t<T;++t)
+            for(int j=0;j<D;++j)
+                g[t][j] *= mask[t][j]/(1.f-rate);
+        return g;
+    }
+};
+
+// Capa lineal + Adam
+struct Lineal {
+    std::vector<std::vector<float>> w, m_w, v_w, grad_w;
+    std::vector<float> b, m_b, v_b, grad_b;
+    std::vector<std::vector<float>> cache_x;
+    float beta1=0.9f, beta2=0.999f, eps_opt=1e-8f;
+    int tstep=0;
+
+    Lineal(int dim_in,int dim_out) {
+        float lim = std::sqrt(6.f/(dim_in+dim_out));
+        w.resize(dim_out, std::vector<float>(dim_in));
+        grad_w = w; m_w = w; v_w = w;
+        for(auto &fila: w)
+            for(float &val: fila)
+                val = randf(-lim, lim);
+        b.resize(dim_out); grad_b.assign(dim_out,0.f);
+        m_b.assign(dim_out,0.f); v_b.assign(dim_out,0.f);
+        for(float &val: b) val = randf(-lim, lim);
+    }
+
+    // Forward para un vector
+    std::vector<float> forward(const std::vector<float> &x) {
+        cache_x = {x};
+        std::vector<float> y(w.size());
+        for(size_t i=0;i<w.size();++i) {
+            float s = b[i];
+            for(size_t j=0;j<w[i].size();++j)
+                s += w[i][j]*x[j];
+            y[i] = s;
+        }
+        return y;
+    }
+
+    // Forward por lotes preservando cache_x completo
+    std::vector<std::vector<float>> forward(const std::vector<std::vector<float>> &x) {
+        cache_x = x;
+        int num_muestras = x.size();
+        int dim_salida   = w.size();
+        int dim_entrada  = w[0].size();
+        std::vector<std::vector<float>> y(num_muestras, std::vector<float>(dim_salida));
+        for (int n = 0; n < num_muestras; ++n) {
+            for (int i = 0; i < dim_salida; ++i) {
+                float s = b[i];
+                for (int j = 0; j < dim_entrada; ++j)
+                    s += w[i][j] * x[n][j];
+                y[n][i] = s;
+            }
+        }
+        return y;
+    }
+
+    std::vector<std::vector<float>> backward(const std::vector<std::vector<float>> &g_out) {
+        int N=g_out.size(), D_in=w[0].size();
+        std::vector<std::vector<float>> grad_in(N, std::vector<float>(D_in,0.f));
+        for(int n=0;n<N;++n) {
+            auto &x = cache_x[n];
+            auto &go = g_out[n];
+            for(size_t i=0;i<w.size();++i) {
+                grad_b[i] += go[i];
+                for(size_t j=0;j<w[i].size();++j) {
+                    grad_w[i][j] += go[i]*x[j];
+                    grad_in[n][j] += w[i][j]*go[i];
+                }
+            }
+        }
+        return grad_in;
+    }
+    std::vector<float> backward(const std::vector<float> &g_out) {
+        auto gm = backward(std::vector<std::vector<float>>{g_out});
+        return gm[0];
+    }
+
+    void step_adam(float lr,int batch) {
+        ++tstep;
+        float lr_t = lr*std::sqrt(1 - std::pow(beta2,tstep))/(1 - std::pow(beta1,tstep));
+        for(size_t i=0;i<w.size();++i) {
+            for(size_t j=0;j<w[i].size();++j) {
+                float g = grad_w[i][j]/batch;
+                m_w[i][j] = beta1*m_w[i][j] + (1-beta1)*g;
+                v_w[i][j] = beta2*v_w[i][j] + (1-beta2)*g*g;
+                w[i][j] -= lr_t*m_w[i][j]/(std::sqrt(v_w[i][j])+eps_opt);
+                grad_w[i][j] = 0;
+            }
+        }
+        for(size_t i=0;i<b.size();++i) {
+            float g = grad_b[i]/batch;
+            m_b[i] = beta1*m_b[i] + (1-beta1)*g;
+            v_b[i] = beta2*v_b[i] + (1-beta2)*g*g;
+            b[i] -= lr_t*m_b[i]/(std::sqrt(v_b[i])+eps_opt);
+            grad_b[i] = 0;
+        }
+    }
+};
+
+// Multi-Head Attention con forward corregido y backward propagando a w_o
+struct MultiCabezaAtencion {
+    int d_model,h,d_k;
+    Lineal w_q,w_k,w_v,w_o;
+    // caches
+    std::vector<std::vector<std::vector<float>>> Qh,Kh,Vh,attn,ctx;
+    std::vector<std::vector<float>> x_cache;
+
+    MultiCabezaAtencion(int dm,int nh): d_model(dm), h(nh), d_k(dm/nh),
+        w_q(dm,dm), w_k(dm,dm), w_v(dm,dm), w_o(dm,dm)
+    {
+        assert(dm%nh==0);
+    }
+
+    std::vector<std::vector<float>> forward(const std::vector<std::vector<float>> &x) {
+        x_cache = x;
+        int T = x.size();
+        auto Q = w_q.forward(x);
+        auto K = w_k.forward(x);
+        auto V = w_v.forward(x);
+        // dividir en cabezas
+        Qh.assign(h, std::vector<std::vector<float>>(T, std::vector<float>(d_k)));
+        Kh.assign(h, std::vector<std::vector<float>>(T, std::vector<float>(d_k)));
+        Vh.assign(h, std::vector<std::vector<float>>(T, std::vector<float>(d_k)));
+        for(int head=0; head<h; ++head) {
+            for(int t=0; t<T; ++t) {
+                Qh[head][t] = {Q[t].begin() + head*d_k, Q[t].begin() + (head+1)*d_k};
+                Kh[head][t] = {K[t].begin() + head*d_k, K[t].begin() + (head+1)*d_k};
+                Vh[head][t] = {V[t].begin() + head*d_k, V[t].begin() + (head+1)*d_k};
+            }
+        }
+        attn.assign(h, std::vector<std::vector<float>>(T, std::vector<float>(T)));
+        ctx.assign(h,  std::vector<std::vector<float>>(T, std::vector<float>(d_k,0.f)));
+        std::vector<std::vector<float>> concat(T, std::vector<float>(d_model));
+        float escala = 1.f/std::sqrt((float)d_k);
+        for(int head=0; head<h; ++head) {
+            // scores + softmax + contexto
+            for(int i=0;i<T;++i){
+                for(int j=0;j<T;++j){
+                    float s=0;
+                    for(int k=0;k<d_k;++k)
+                        s += Qh[head][i][k]*Kh[head][j][k];
+                    attn[head][i][j] = s*escala;
+                }
+                float mx = *std::max_element(attn[head][i].begin(), attn[head][i].end());
+                float den = 0;
+                for(float &v: attn[head][i]) { v = std::exp(v-mx); den += v; }
+                for(float &v: attn[head][i]) v /= den;
+                for(int j=0;j<T;++j)
+                    for(int k=0;k<d_k;++k)
+                        ctx[head][i][k] += attn[head][i][j]*Vh[head][j][k];
+            }
+            for(int i=0;i<T;++i)
+                for(int k=0;k<d_k;++k)
+                    concat[i][head*d_k+k] = ctx[head][i][k];
+        }
+        return w_o.forward(concat);
+    }
+
+    // Propagar al menos el gradiente a w_o
+    std::vector<std::vector<float>> backward(const std::vector<std::vector<float>> &grad_out) {
+        auto grad_concat = w_o.backward(grad_out);
+        return grad_concat;
+    }
+
+    void step_adam(float lr,int batch) {
+        w_q.step_adam(lr,batch);
+        w_k.step_adam(lr,batch);
+        w_v.step_adam(lr,batch);
+        w_o.step_adam(lr,batch);
+    }
+};
+
+// FeedForward
+struct FeedForward {
+    Lineal l1,l2;
+    Dropout drop;
+    std::vector<std::vector<float>> mask_relu;
+    FeedForward(int dm,int dff): l1(dm,dff), l2(dff,dm), drop(0.1f) {}
+    std::vector<std::vector<float>> forward(const std::vector<std::vector<float>> &x,bool train) {
+        auto h1 = l1.forward(x);
+        // ReLU
+        mask_relu.resize(h1.size(), std::vector<float>(h1[0].size()));
+        for(size_t i=0;i<h1.size();++i)
+            for(size_t j=0;j<h1[i].size();++j) {
+                mask_relu[i][j] = h1[i][j]>0?1.f:0.f;
+                if(mask_relu[i][j]==0) h1[i][j]=0;
+            }
+        auto hdrop = drop.forward(h1, train);
+        return l2.forward(hdrop);
+    }
+    std::vector<std::vector<float>> backward(const std::vector<std::vector<float>> &g,bool train) {
+        auto g2    = l2.backward(g);
+        auto gdrop = drop.backward(g2);
+        for(size_t i=0;i<gdrop.size();++i)
+            for(size_t j=0;j<gdrop[0].size();++j)
+                gdrop[i][j] *= mask_relu[i][j];
+        return l1.backward(gdrop);
+    }
+    void step_adam(float lr,int batch) {
+        l1.step_adam(lr,batch);
+        l2.step_adam(lr,batch);
+    }
+};
+
+// Bloque Encoder con dropouts separados
+struct BloqueEncoder {
+    MultiCabezaAtencion mha;
+    FeedForward ff;
+    CapaNorm norm1,norm2;
+    Dropout dropout_atencion, dropout_ff;
+
+    BloqueEncoder(int dm,int nh,int dff)
+      : mha(dm,nh), ff(dm,dff), norm1(dm), norm2(dm),
+        dropout_atencion(0.1f), dropout_ff(0.1f) {}
+
+    std::vector<std::vector<float>> forward(std::vector<std::vector<float>> &x,bool train) {
+        // Sublayer 1
+        auto x1         = norm1.forward(x);
+        auto attn_out   = mha.forward(x1);
+        auto attn_drop  = dropout_atencion.forward(attn_out, train);
+        for(size_t t=0;t<x.size();++t)
+            for(size_t j=0;j<x[0].size();++j)
+                x[t][j] += attn_drop[t][j];
+
+        // Sublayer 2
+        auto x2       = norm2.forward(x);
+        auto ff_out   = ff.forward(x2, train);
+        auto ff_drop  = dropout_ff.forward(ff_out, train);
+        for(size_t t=0;t<x.size();++t)
+            for(size_t j=0;j<x[0].size();++j)
+                x[t][j] += ff_drop[t][j];
+
+        return x;
+    }
+
+    std::vector<std::vector<float>> backward(std::vector<std::vector<float>> &g,bool train) {
+        // FF branch
+        auto g_ff      = ff.backward(dropout_ff.backward(g), train);
+        auto g_norm2   = norm2.backward(g_ff);
+        for(size_t t=0;t<g.size();++t)
+            for(size_t j=0;j<g[0].size();++j)
+                g[t][j] += g_norm2[t][j];
+
+        // Attention branch
+        auto g_attn    = mha.backward(dropout_atencion.backward(g));
+        auto g_norm1   = norm1.backward(g_attn);
+        for(size_t t=0;t<g.size();++t)
+            for(size_t j=0;j<g[0].size();++j)
+                g[t][j] += g_norm1[t][j];
+
+        return g;
+    }
+
+    void step_adam(float lr,int batch) {
+        mha.step_adam(lr,batch);
+        ff.step_adam(lr,batch);
+        norm1.step_adam(lr,batch,0.9f,0.999f,1e-8f);
+        norm2.step_adam(lr,batch,0.9f,0.999f,1e-8f);
+    }
+};
+
+// Encoder completo
+struct Encoder {
+    std::vector<BloqueEncoder> bloques;
+    CapaNorm norm_final;
+    Encoder(int N,int dm,int nh,int dff): norm_final(dm) {
+        for(int i=0;i<N;++i)
+            bloques.emplace_back(dm,nh,dff);
+    }
+    std::vector<std::vector<float>> forward(std::vector<std::vector<float>> &x,bool train) {
+        for(auto &b: bloques) b.forward(x,train);
+        return norm_final.forward(x);
+    }
+    std::vector<std::vector<float>> backward(std::vector<std::vector<float>> &g,bool train) {
+        auto gr = norm_final.backward(g);
+        for(int i=bloques.size()-1;i>=0;--i)
+            gr = bloques[i].backward(gr,train);
+        return gr;
+    }
+    void step_adam(float lr,int batch) {
+        norm_final.step_adam(lr,batch,0.9f,0.999f,1e-8f);
+        for(auto &b: bloques) b.step_adam(lr,batch);
+    }
+};
+
+// Clasificador
+struct ClasificadorMNIST {
+    Lineal proy_pix;
+    Encoder encoder;
+    Lineal capa_salida;
+    std::vector<std::vector<float>> pos_enc;
+    int seq_len, d_model;
+    ClasificadorMNIST(int sl=28,int dm=128,int N=2,int nh=4,int dff=256)
+      : proy_pix(sl,dm), encoder(N,dm,nh,dff), capa_salida(dm,10),
+        seq_len(sl), d_model(dm)
+    {
+        pos_enc.assign(sl, std::vector<float>(dm));
+        for(int pos=0; pos<sl; ++pos)
+            for(int i=0; i<dm; i+=2) {
+                float div = std::exp(-std::log(10000.f)*i/dm);
+                pos_enc[pos][i]   = std::sin(pos*div);
+                if(i+1<dm)
+                    pos_enc[pos][i+1] = std::cos(pos*div);
+            }
+    }
+    std::tuple<std::vector<std::vector<float>>, std::vector<float>> forward_cache(
+        std::vector<std::vector<float>> img, bool train)
+    {
+        auto x = proy_pix.forward(img);
+        for(int t=0;t<seq_len;++t)
+            for(int j=0;j<d_model;++j)
+                x[t][j] += pos_enc[t][j];
+        auto enc_out = encoder.forward(x,train);
+        std::vector<float> pooled(d_model,0.f);
+        for(int j=0;j<d_model;++j)
+            for(int t=0;t<seq_len;++t)
+                pooled[j] += enc_out[t][j]/seq_len;
+        auto logits = capa_salida.forward(pooled);
+        return {enc_out, logits};
+    }
+    void backward_batch(const std::vector<float> &d_logits) {
+        auto d_pooled = capa_salida.backward(d_logits);
+        std::vector<std::vector<float>> d_enc(seq_len, std::vector<float>(d_model));
+        for(int t=0;t<seq_len;++t)
+            for(int j=0;j<d_model;++j)
+                d_enc[t][j] = d_pooled[j]/seq_len;
+        auto g_enc = encoder.backward(d_enc, true);
+        proy_pix.backward(g_enc);
+    }
+    void step_adam_batch(float lr, int batch) {
+        capa_salida.step_adam(lr,batch);
+        encoder.step_adam(lr,batch);
+        proy_pix.step_adam(lr,batch);
+    }
+};
+
+// Pérdida Cross-Entropy
+float perdida_cross_entropy(const std::vector<float> &probs, int y) {
+    constexpr float eps = 1e-8f;
+    return -std::log(probs[y] + eps);
+}
+
+// argmax
+int argmax(const std::vector<float> &v) {
+    return std::max_element(v.begin(), v.end()) - v.begin();
+}
+
+std::vector<MuestraMnist> cargar_mnist_csv(const std::string &ruta) {
+    std::vector<MuestraMnist> datos;
+    std::ifstream f(ruta);
+    if (!f.is_open()) {
+        std::cerr << "No puedo abrir " << ruta << "\n";
+        return datos;
+    }
+    std::string linea;
+    // Detectar encabezado
+    if (std::getline(f, linea)) {
+        std::stringstream ss(linea);
+        std::string tok;
+        std::getline(ss, tok, ',');
+        bool enc = false;
+        try { static_cast<void>(std::stoi(tok)); }
+        catch (...) { enc = true; }
+        if (!enc) f.seekg(0);
+    }
+    while (std::getline(f, linea)) {
+        if (linea.empty()) continue;
+        std::stringstream ss(linea);
+        std::string tok;
+        std::getline(ss, tok, ',');
+        int label = std::stoi(tok);
+        std::vector<float> pix;
+        while (std::getline(ss, tok, ','))
+            pix.push_back(std::stof(tok) / 255.f);
+        if (pix.size() != 28*28) continue;
+        std::vector<std::vector<float>> img(28, std::vector<float>(28));
+        for (int i = 0; i < 28; ++i)
+            for (int j = 0; j < 28; ++j)
+                img[i][j] = pix[i*28 + j];
+        datos.push_back({img, label});
+    }
+    return datos;
+}
+
+
+int main() {
+    auto train = cargar_mnist_csv("mnist_train.csv");
+    auto test  = cargar_mnist_csv("mnist_test.csv");
+
+    std::cout << "Empezando\n";
+
+    ClasificadorMNIST modelo;
+    float lr = 3e-4f;
+    int epochs = 10;
+    int batch_size = 64;
+
+    for (int e = 0; e < epochs; ++e) {
+        std::shuffle(train.begin(), train.end(), rng);
+        float loss_acum = 0.f;
+        int cont = 0;
+        std::vector<std::pair<std::vector<std::vector<float>>, int>> buffer;
+        buffer.reserve(batch_size);
+
+        // ——— Entrenamiento ———
+        for (size_t idx = 0; idx < train.size(); ++idx) {
+            auto &m = train[idx];
+            auto [feat, logits] = modelo.forward_cache(m.imagen, true);
+            auto probs = logits;
+            softmax(probs);
+            loss_acum += perdida_cross_entropy(probs, m.etiqueta);
+
+            buffer.emplace_back(m.imagen, m.etiqueta);
+            if (buffer.size() == batch_size || idx + 1 == train.size()) {
+                for (auto &[img, label] : buffer) {
+                    auto [_, logits_b] = modelo.forward_cache(img, true);
+                    auto probs_b = logits_b;
+                    softmax(probs_b);
+                    std::vector<float> dlog(10);
+                    for (int k = 0; k < 10; ++k)
+                        dlog[k] = probs_b[k] - (k == label ? 1.f : 0.f);
+                    modelo.backward_batch(dlog);
+                }
+                modelo.step_adam_batch(lr, buffer.size());
+                buffer.clear();
+            }
+
+            if (++cont % 2000 == 0)
+                std::cout << "  " << cont << " muestras...\n";
+        }
+
+        // ——— Pérdida media de la época ———
+        float perdida_media = loss_acum / train.size();
+        std::cout << "Epoch " << (e+1)
+                  << " - pérdida media: " << perdida_media;
+
+        // ——— Cálculo de exactitud en test ———
+        int aciertos = 0;
+        for (auto &m : test) {
+            auto [feat_t, logits_t] = modelo.forward_cache(m.imagen, false);
+            auto probs_t = logits_t;
+            softmax(probs_t);
+            if (argmax(probs_t) == m.etiqueta)
+                ++aciertos;
+        }
+        float exactitud = 100.f * aciertos / test.size();
+        std::cout << " - exactitud test: " << exactitud << "%\n";
+    }
+
+    return 0;
+}
